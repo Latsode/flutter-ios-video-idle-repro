@@ -8,27 +8,27 @@ on:
 jobs:
   measure:
     runs-on: macos-15
-    timeout-minutes: 40
+    timeout-minutes: 75
+    # avfoundation 2.8.4 has been seen shutting the simulator down mid-run.
+    continue-on-error: ${{ !matrix.upgrade_plugin }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          # Same Flutter and plugin versions as realize-app-flutter.
-          - label: realize-current (Flutter 3.27.4, avfoundation 2.8.4)
-            artifact: realize-current
-            flutter: 3.27.4
+          # Same Flutter and plugin versions as realize-app-flutter dev.
+          - label: dev-current (Flutter 3.47.5, avfoundation 2.8.4)
+            artifact: dev-current
             upgrade_plugin: false
-          # Latest plugin, which stops the display link on dispose (2.9.4+).
-          - label: upgraded (Flutter 3.44.2, latest video_player)
-            artifact: upgraded
-            flutter: 3.44.2
+          # Proposed dependency fix: latest video_player (avfoundation >= 2.9.4).
+          - label: proposed (Flutter 3.47.5, latest video_player)
+            artifact: proposed
             upgrade_plugin: true
     steps:
       - uses: actions/checkout@v4
 
       - uses: subosito/flutter-action@v2
         with:
-          flutter-version: ${{ matrix.flutter }}
+          flutter-version: 3.47.5
           channel: stable
           cache: true
 
@@ -42,7 +42,7 @@ jobs:
           p = re.sub(r'dependency_overrides:\n  video_player_avfoundation: 2\.8\.4\n', '', p)
           open('pubspec.yaml', 'w').write(p)
           PY
-          flutter pub upgrade
+          flutter pub upgrade video_player
 
       - run: flutter pub get
 

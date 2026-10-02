@@ -7,8 +7,9 @@ environment:
 dependencies:
   flutter:
     sdk: flutter
-  # Same versions as realize-app-flutter (master and dev lockfiles).
+  # Same versions as realize-app-flutter (dev lockfile).
   video_player: 2.10.0
+  visibility_detector: 0.4.0+2
 dependency_overrides:
   video_player_avfoundation: 2.8.4
 dev_dependencies:

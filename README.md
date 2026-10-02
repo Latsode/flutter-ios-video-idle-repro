@@ -13,19 +13,21 @@ texture. A texture that is never shown is never pulled, so every vsync calls
 Before `video_player_avfoundation` 2.9.4 the display link also kept running after
 the controller was disposed, so the cost outlived the feed card.
 
-Each app launch runs one scenario through three phases with no input:
-`baseline` (thumbnails only), `active` (scenario cards built, measured once all
-videos are initialized) and `afterDispose` (cards removed again).
+Each app launch runs one card implementation in a 12-card feed that the app
+scrolls by itself. Phases: `baseline` (no feed), `active` (after browsing 6
+steps), `play` (tap play on the most visible card, measure time until playback
+advances, pause), `paused`, `scrolledOn` (4 more steps) and `afterDispose` (feed
+removed). Idle cost is measured in each phase except `play`.
 
-| Scenario | Cards in `active` |
+| Scenario | Card implementation |
 |---|---|
-| eagerThumbnail | Controllers initialized, thumbnails only (Realize pattern) |
-| eagerThumbnailUnderRoute | Same, with another screen pushed on top |
-| eagerShown | Controllers initialized and video shown, paused |
-| lazy | Controller created only on play tap (fix; never tapped) |
+| eagerThumbnail | Current Realize `PostVideo`: initialize in `initState`, thumbnail only |
+| coveredWarm | Initialize in `initState`, video painted under an opaque thumbnail (feed without cache extent) |
+| proposed | Initialize when at least 60% visible, video painted under the thumbnail, released when fully off screen |
+| lazy | Initialize only when play is tapped |
 
-CI runs it twice: with Realize's versions (Flutter 3.27.4, avfoundation 2.8.4)
-and with the latest `video_player`.
+CI runs it with Realize `dev` versions (Flutter 3.47.5, avfoundation 2.8.4) and
+with the latest `video_player`.
 
 ## Run without an iPhone or Mac
 

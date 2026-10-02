@@ -25,10 +25,10 @@ BUNDLE_ID = "ge.realize.repro.iosVideoIdleRepro"
 APP_PATH = Path("build/ios/iphonesimulator/Runner.app")
 OUT = Path(os.environ.get("OUT", "build/repro-results"))
 LABEL = os.environ.get("REPRO_LABEL", "")
-PHASES = ["baseline", "active", "afterDispose"]
+PHASES = ["baseline", "active", "paused", "scrolledOn", "afterDispose"]
 # The app holds each MEASURE window for 15s; leave margin at both ends.
 MEASURE_FROM, MEASURE_TO = 2, 13
-SCENARIOS = ["eagerThumbnail", "eagerThumbnailUnderRoute", "eagerShown", "lazy"]
+SCENARIOS = ["eagerThumbnail", "coveredWarm", "proposed", "lazy"]
 SAMPLE_SECONDS = 3
 SYMBOLS = {
     "displayLinkFired": "displayLinkFired",
@@ -68,7 +68,7 @@ def read_log(log_path):
         parts = line.split()
         if len(parts) >= 3 and parts[1] == "MEASURE":
             window, started = parts[2], int(parts[0]) / 1000
-        elif len(parts) >= 2 and parts[1] in ("PHASE", "READY"):
+        elif len(parts) >= 2 and parts[1] in ("PHASE", "READY", "TARGET", "TAP"):
             window, started = None, None
         elif len(parts) >= 2 and parts[1] == "DONE":
             done = True
@@ -122,7 +122,7 @@ def run_scenario(udid, scenario):
     print(f"[{scenario}] pid {pid}", flush=True)
 
     cpu, sampled, samplers = {}, set(), []
-    deadline = time.time() + 240
+    deadline = time.time() + 480
     while time.time() < deadline:
         window, started, done, _ = read_log(log_path)
         if done:
@@ -145,12 +145,24 @@ def run_scenario(udid, scenario):
 
     _, _, _, lines = read_log(log_path)
     (OUT / f"{scenario}_phases.log").write_text("\n".join(lines) + "\n")
+    def count(word):
+        return sum(len(l.split()) > 1 and l.split()[1] == word for l in lines)
+
+    live = {}
+    latency = None
+    for line in lines:
+        parts = line.split()
+        if len(parts) >= 4 and parts[1] == "LIVE_CONTROLLERS":
+            live[parts[2]] = int(parts[3])
+        elif len(parts) >= 3 and parts[1] == "START_LATENCY_MS":
+            latency = int(parts[2])
     events = {
-        "INITIALIZED": sum(" INITIALIZED" in l for l in lines),
-        "INIT_FAILED": sum(" INIT_FAILED" in l for l in lines),
-        "DISPOSED": sum(" DISPOSED" in l for l in lines),
-        "READY_TIMEOUT": sum(" READY_TIMEOUT" in l for l in lines),
         "scenario_logged": next((l.split()[2] for l in lines if " SCENARIO " in l), None),
+        "initialized": count("INITIALIZED"),
+        "init_failed": count("INIT_FAILED"),
+        "released": count("RELEASED"),
+        "ready_timeouts": count("READY_TIMEOUT"),
+        "start_latency_ms": latency,
     }
 
     rows = []
@@ -160,8 +172,28 @@ def run_scenario(udid, scenario):
         path = OUT / f"sample_{scenario}_{phase}.txt"
         text = path.read_text(errors="replace") if path.exists() else ""
         counts = {k: max_samples(text, needle) for k, needle in SYMBOLS.items()}
-        rows.append((scenario, phase, avg, len(values), counts))
+        rows.append((scenario, phase, avg, len(values), counts, live.get(phase)))
     return rows, events
+
+
+def write_summary(device, table, event_lines, final):
+    title = f"## iOS Simulator idle cost {LABEL}".rstrip()
+    summary = (
+        f"{title}\n\nSimulator: {device['name']}\n\n"
+        + "\n".join(table)
+        + f"\n\nCPU is averaged over seconds {MEASURE_FROM}-{MEASURE_TO} of each phase's "
+        "measure window (after videos are ready / disposed). Stack columns: peak sample count containing the symbol "
+        f"during a {SAMPLE_SECONDS}s `sample` of the app (0 = not seen).\n\n"
+        "Verdict is BUSY when CPU is at least "
+        f"{BUSY_CPU:.0f}% or the engine redraw / plugin display link shows up in the stacks.\n\n"
+        "Video events per scenario (start_latency_ms = tap play until playback position advances):\n" + "\n".join(event_lines) + "\n"
+    )
+    (OUT / "summary.md").write_text(summary)
+    if final:
+        print(summary)
+    if final and (summary_file := os.environ.get("GITHUB_STEP_SUMMARY")):
+        with open(summary_file, "a") as f:
+            f.write(summary)
 
 
 def main():
@@ -176,37 +208,25 @@ def main():
     run("xcrun", "simctl", "install", udid, str(APP_PATH))
 
     table = [
-        "| Scenario | Phase | Avg CPU % | ps samples | Verdict "
+        "| Scenario | Phase | Live players | Avg CPU % | ps samples | Verdict "
         "| displayLinkFired | textureFrameAvailable | DrawLastLayerTrees |",
-        "|" + "---|" * 8,
+        "|" + "---|" * 9,
     ]
     event_lines = []
     for scenario in SCENARIOS:
         rows, events = run_scenario(udid, scenario)
         event_lines.append(f"- {scenario}: {events}")
-        for _, phase, avg, n, c in rows:
-            verdict = "BUSY" if avg >= BUSY_CPU else "idle"
+        for _, phase, avg, n, c, live in rows:
+            redrawing = c["DrawLastLayerTrees"] > 0 or c["displayLinkFired"] > 0
+            verdict = "BUSY" if avg >= BUSY_CPU or redrawing else "idle"
             table.append(
-                f"| {scenario} | {phase} | {avg:.1f} | {n} | {verdict} "
+                f"| {scenario} | {phase} | {live} | {avg:.1f} | {n} | {verdict} "
                 f"| {c['displayLinkFired']} | {c['textureFrameAvailable']} "
                 f"| {c['DrawLastLayerTrees']} |"
             )
-
-    title = f"## iOS Simulator idle cost {LABEL}".rstrip()
-    summary = (
-        f"{title}\n\nSimulator: {device['name']}\n\n"
-        + "\n".join(table)
-        + f"\n\nCPU is averaged over seconds {MEASURE_FROM}-{MEASURE_TO} of each phase's "
-        "measure window (after videos are ready / disposed). Stack columns: peak sample count containing the symbol "
-        f"during a {SAMPLE_SECONDS}s `sample` of the app (0 = not seen).\n\n"
-        "Video events per scenario:\n" + "\n".join(event_lines) + "\n"
-    )
-    (OUT / "summary.md").write_text(summary)
-    print(summary)
-    if summary_file := os.environ.get("GITHUB_STEP_SUMMARY"):
-        with open(summary_file, "a") as f:
-            f.write(summary)
-
+        # Keep partial results if a later scenario fails.
+        write_summary(device, table, event_lines, final=False)
+    write_summary(device, table, event_lines, final=True)
 
 if __name__ == "__main__":
     main()
