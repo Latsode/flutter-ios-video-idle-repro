@@ -1,0 +1,34 @@
+name: iOS Simulator idle-cost repro
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  measure:
+    runs-on: macos-15
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: subosito/flutter-action@v2
+        with:
+          # Same Flutter version as realize-app-flutter .fvmrc.
+          flutter-version: 3.27.4
+          channel: stable
+          cache: true
+
+      - run: flutter pub get
+
+      - name: Build for simulator
+        run: flutter build ios --simulator --debug
+
+      - name: Run and measure
+        run: python3 tool/measure_ios_sim.py
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: repro-results
+          path: build/repro-results

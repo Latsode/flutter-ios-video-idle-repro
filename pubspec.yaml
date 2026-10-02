@@ -1,0 +1,19 @@
+name: ios_video_idle_repro
+description: "Minimal repro: iOS video_player keeps the Flutter engine redrawing while an initialized video is never shown."
+publish_to: 'none'
+version: 1.0.0+1
+environment:
+  sdk: ^3.6.2
+dependencies:
+  flutter:
+    sdk: flutter
+  # Same versions as realize-app-flutter (master and dev lockfiles).
+  video_player: 2.10.0
+dependency_overrides:
+  video_player_avfoundation: 2.8.4
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^5.0.0
+flutter:
+  uses-material-design: true
