@@ -13,9 +13,9 @@ texture. A texture that is never shown is never pulled, so every vsync calls
 Before `video_player_avfoundation` 2.9.4 the display link also kept running after
 the controller was disposed, so the cost outlived the feed card.
 
-Each app launch runs one scenario (`REPRO_SCENARIO`) through three 20-second
-phases with no input: `baseline` (thumbnails only), `active` (scenario cards
-built) and `afterDispose` (cards removed again).
+Each app launch runs one scenario through three phases with no input:
+`baseline` (thumbnails only), `active` (scenario cards built, measured once all
+videos are initialized) and `afterDispose` (cards removed again).
 
 | Scenario | Cards in `active` |
 |---|---|

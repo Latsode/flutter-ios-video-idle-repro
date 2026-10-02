@@ -25,11 +25,10 @@ BUNDLE_ID = "ge.realize.repro.iosVideoIdleRepro"
 APP_PATH = Path("build/ios/iphonesimulator/Runner.app")
 OUT = Path(os.environ.get("OUT", "build/repro-results"))
 LABEL = os.environ.get("REPRO_LABEL", "")
-PHASE_SECONDS = 20
 PHASES = ["baseline", "active", "afterDispose"]
+# The app holds each MEASURE window for 15s; leave margin at both ends.
+MEASURE_FROM, MEASURE_TO = 2, 13
 SCENARIOS = ["eagerThumbnail", "eagerThumbnailUnderRoute", "eagerShown", "lazy"]
-# Skip app start-up, video download and route transitions at phase start.
-SETTLE_SECONDS = 8
 SAMPLE_SECONDS = 3
 SYMBOLS = {
     "displayLinkFired": "displayLinkFired",
@@ -59,18 +58,21 @@ def pick_device():
 
 
 def read_log(log_path):
+    """Return (current measure window name or None, its start time, done, lines)."""
     try:
         lines = log_path.read_text().splitlines()
     except FileNotFoundError:
-        return None, None, []
-    phase, started = None, None
+        return None, None, False, []
+    window, started, done = None, None, False
     for line in lines:
         parts = line.split()
-        if len(parts) >= 3 and parts[1] == "PHASE":
-            phase, started = parts[2], int(parts[0]) / 1000
+        if len(parts) >= 3 and parts[1] == "MEASURE":
+            window, started = parts[2], int(parts[0]) / 1000
+        elif len(parts) >= 2 and parts[1] in ("PHASE", "READY"):
+            window, started = None, None
         elif len(parts) >= 2 and parts[1] == "DONE":
-            phase, started = "DONE", int(parts[0]) / 1000
-    return phase, started, lines
+            done = True
+    return window, started, done, lines
 
 
 def max_samples(sample_text, needle):
@@ -83,51 +85,63 @@ def max_samples(sample_text, needle):
     return best
 
 
-def run_scenario(udid, scenario, log_path):
+def launch(udid, scenario):
+    for attempt in range(5):
+        result = subprocess.run(
+            ["xcrun", "simctl", "launch",
+             f"--stdout={OUT.resolve()}/{scenario}_stdout.log",
+             f"--stderr={OUT.resolve()}/{scenario}_stderr.log",
+             udid, BUNDLE_ID],
+            capture_output=True, text=True,
+        )
+        if result.returncode == 0:
+            return int(result.stdout.strip().split(":")[-1])
+        print(f"[{scenario}] launch attempt {attempt + 1} failed: {result.stderr.strip()}", flush=True)
+        time.sleep(3)
+    sys.exit(f"[{scenario}] could not launch app")
+
+
+def run_scenario(udid, scenario, data_dir):
     run("xcrun", "simctl", "terminate", udid, BUNDLE_ID, check=False)
+    time.sleep(3)
+    tmp = data_dir / "tmp"
+    tmp.mkdir(parents=True, exist_ok=True)
+    log_path = tmp / "repro_phases.log"
     log_path.unlink(missing_ok=True)
-    env = dict(os.environ, SIMCTL_CHILD_REPRO_SCENARIO=scenario)
-    launch = run(
-        "xcrun", "simctl", "launch",
-        f"--stdout={OUT.resolve()}/{scenario}_stdout.log",
-        f"--stderr={OUT.resolve()}/{scenario}_stderr.log",
-        udid, BUNDLE_ID, env=env,
-    )
-    pid = int(launch.strip().split(":")[-1])
+    (tmp / "repro_scenario").write_text(scenario)
+    pid = launch(udid, scenario)
     print(f"[{scenario}] pid {pid}", flush=True)
 
     cpu, sampled, samplers = {}, set(), []
-    deadline = time.time() + PHASE_SECONDS * (len(PHASES) + 2)
+    deadline = time.time() + 240
     while time.time() < deadline:
-        phase, started, _ = read_log(log_path)
-        if phase == "DONE":
+        window, started, done, _ = read_log(log_path)
+        if done:
             break
-        if phase is None:
-            time.sleep(1)
-            continue
-        elapsed = time.time() - started
-        if SETTLE_SECONDS <= elapsed < PHASE_SECONDS - 1:
+        if window and MEASURE_FROM <= time.time() - started < MEASURE_TO:
             value = run("ps", "-p", str(pid), "-o", "%cpu=", check=False).strip()
             if not value:
-                sys.exit(f"[{scenario}] app exited early; see {scenario}_stderr.log")
-            cpu.setdefault(phase, []).append(float(value))
-            if phase not in sampled:
-                sampled.add(phase)
+                sys.exit(f"[{scenario}] app exited early")
+            cpu.setdefault(window, []).append(float(value))
+            if window not in sampled:
+                sampled.add(window)
                 samplers.append(subprocess.Popen(
                     ["sample", str(pid), str(SAMPLE_SECONDS), "-file",
-                     str(OUT / f"sample_{scenario}_{phase}.txt")],
+                     str(OUT / f"sample_{scenario}_{window}.txt")],
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 ))
         time.sleep(1)
     for sampler in samplers:
         sampler.wait()
 
-    _, _, lines = read_log(log_path)
+    _, _, _, lines = read_log(log_path)
     (OUT / f"{scenario}_phases.log").write_text("\n".join(lines) + "\n")
     events = {
         "INITIALIZED": sum(" INITIALIZED" in l for l in lines),
         "INIT_FAILED": sum(" INIT_FAILED" in l for l in lines),
         "DISPOSED": sum(" DISPOSED" in l for l in lines),
+        "READY_TIMEOUT": sum(" READY_TIMEOUT" in l for l in lines),
+        "scenario_logged": next((l.split()[2] for l in lines if " SCENARIO " in l), None),
     }
 
     rows = []
@@ -154,7 +168,6 @@ def main():
     run("xcrun", "simctl", "bootstatus", udid, "-b")
     run("xcrun", "simctl", "install", udid, str(APP_PATH))
     data_dir = Path(run("xcrun", "simctl", "get_app_container", udid, BUNDLE_ID, "data").strip())
-    log_path = data_dir / "tmp" / "repro_phases.log"
 
     table = [
         "| Scenario | Phase | Avg CPU % | ps samples | Verdict "
@@ -163,7 +176,7 @@ def main():
     ]
     event_lines = []
     for scenario in SCENARIOS:
-        rows, events = run_scenario(udid, scenario, log_path)
+        rows, events = run_scenario(udid, scenario, data_dir)
         event_lines.append(f"- {scenario}: {events}")
         for _, phase, avg, n, c in rows:
             verdict = "BUSY" if avg >= BUSY_CPU else "idle"
@@ -177,8 +190,8 @@ def main():
     summary = (
         f"{title}\n\nSimulator: {device['name']}\n\n"
         + "\n".join(table)
-        + f"\n\nPhases are {PHASE_SECONDS}s; CPU is averaged from second {SETTLE_SECONDS} "
-        "of each phase. Stack columns: peak sample count containing the symbol "
+        + f"\n\nCPU is averaged over seconds {MEASURE_FROM}-{MEASURE_TO} of each phase's "
+        "measure window (after videos are ready / disposed). Stack columns: peak sample count containing the symbol "
         f"during a {SAMPLE_SECONDS}s `sample` of the app (0 = not seen).\n\n"
         "Video events per scenario:\n" + "\n".join(event_lines) + "\n"
     )
