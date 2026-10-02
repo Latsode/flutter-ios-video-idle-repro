@@ -10,16 +10,22 @@ starts a `CADisplayLink` that only stops after the engine pulls a frame from the
 texture. A texture that is never shown is never pulled, so every vsync calls
 `textureFrameAvailable` and the engine redraws the last frame forever.
 
-The app runs these 20-second phases with no input:
+Before `video_player_avfoundation` 2.9.4 the display link also kept running after
+the controller was disposed, so the cost outlived the feed card.
 
-| Phase | What is on screen | Expected |
-|---|---|---|
-| controlIdle | Thumbnails, no controllers | idle |
-| bugFeed | 3 cards, controllers initialized, thumbnails only (Realize pattern) | busy |
-| bugUnderOtherScreen | Same cards, another screen pushed on top | busy |
-| fixLazyInit | 3 cards, controller created only on tap (not tapped) | idle |
-| shownThenPaused | 3 cards, controllers initialized and video shown, paused | idle |
-| controlIdleEnd | Thumbnails again, controllers disposed | idle |
+Each app launch runs one scenario (`REPRO_SCENARIO`) through three 20-second
+phases with no input: `baseline` (thumbnails only), `active` (scenario cards
+built) and `afterDispose` (cards removed again).
+
+| Scenario | Cards in `active` |
+|---|---|
+| eagerThumbnail | Controllers initialized, thumbnails only (Realize pattern) |
+| eagerThumbnailUnderRoute | Same, with another screen pushed on top |
+| eagerShown | Controllers initialized and video shown, paused |
+| lazy | Controller created only on play tap (fix; never tapped) |
+
+CI runs it twice: with Realize's versions (Flutter 3.27.4, avfoundation 2.8.4)
+and with the latest `video_player`.
 
 ## Run without an iPhone or Mac
 

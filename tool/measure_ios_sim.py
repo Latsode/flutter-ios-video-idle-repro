@@ -5,6 +5,9 @@ An app running in the iOS Simulator is an ordinary macOS process, so its CPU
 use can be read with `ps` and its native call stacks with `sample`. Neither
 needs a physical device or Instruments.
 
+Each scenario runs in a fresh app launch so a leak in one scenario cannot
+affect another.
+
 Usage (on macOS with Xcode and Flutter installed):
     flutter build ios --simulator --debug
     python3 tool/measure_ios_sim.py
@@ -21,27 +24,23 @@ from pathlib import Path
 BUNDLE_ID = "ge.realize.repro.iosVideoIdleRepro"
 APP_PATH = Path("build/ios/iphonesimulator/Runner.app")
 OUT = Path(os.environ.get("OUT", "build/repro-results"))
+LABEL = os.environ.get("REPRO_LABEL", "")
 PHASE_SECONDS = 20
+PHASES = ["baseline", "active", "afterDispose"]
+SCENARIOS = ["eagerThumbnail", "eagerThumbnailUnderRoute", "eagerShown", "lazy"]
 # Skip app start-up, video download and route transitions at phase start.
-SETTLE_SECONDS = 7
+SETTLE_SECONDS = 8
 SAMPLE_SECONDS = 3
 SYMBOLS = {
-    "displayLinkFired": "FVPFrameUpdater displayLinkFired",
+    "displayLinkFired": "displayLinkFired",
     "textureFrameAvailable": "textureFrameAvailable",
     "DrawLastLayerTrees": "DrawLastLayerTrees",
 }
-EXPECTED = {
-    "controlIdle": "idle",
-    "bugFeed": "BUSY (bug)",
-    "bugUnderOtherScreen": "BUSY (bug)",
-    "fixLazyInit": "idle",
-    "shownThenPaused": "idle",
-    "controlIdleEnd": "idle",
-}
+BUSY_CPU = 10.0
 
 
-def run(*args, check=True):
-    return subprocess.run(args, check=check, capture_output=True, text=True).stdout
+def run(*args, check=True, env=None):
+    return subprocess.run(args, check=check, capture_output=True, text=True, env=env).stdout
 
 
 def pick_device():
@@ -56,11 +55,10 @@ def pick_device():
     if not iphones:
         sys.exit("No available iPhone simulator")
     booted = [d for _, d in iphones if d["state"] == "Booted"]
-    runtime, device = (None, booted[0]) if booted else sorted(iphones, key=lambda x: x[0])[-1]
-    return device
+    return booted[0] if booted else sorted(iphones, key=lambda x: x[0])[-1][1]
 
 
-def current_phase(log_path):
+def read_log(log_path):
     try:
         lines = log_path.read_text().splitlines()
     except FileNotFoundError:
@@ -85,37 +83,23 @@ def max_samples(sample_text, needle):
     return best
 
 
-def main():
-    if not APP_PATH.exists():
-        sys.exit(f"{APP_PATH} missing; run: flutter build ios --simulator --debug")
-    OUT.mkdir(parents=True, exist_ok=True)
-
-    device = pick_device()
-    udid = device["udid"]
-    print(f"Simulator: {device['name']} ({udid})")
-    if device["state"] != "Booted":
-        run("xcrun", "simctl", "boot", udid, check=False)
-    run("xcrun", "simctl", "bootstatus", udid, "-b")
-    run("xcrun", "simctl", "install", udid, str(APP_PATH))
-
+def run_scenario(udid, scenario, log_path):
+    run("xcrun", "simctl", "terminate", udid, BUNDLE_ID, check=False)
+    log_path.unlink(missing_ok=True)
+    env = dict(os.environ, SIMCTL_CHILD_REPRO_SCENARIO=scenario)
     launch = run(
-        "xcrun", "simctl", "launch", "--terminate-running-process",
-        f"--stdout={OUT.resolve()}/app_stdout.log",
-        f"--stderr={OUT.resolve()}/app_stderr.log",
-        udid, BUNDLE_ID,
+        "xcrun", "simctl", "launch",
+        f"--stdout={OUT.resolve()}/{scenario}_stdout.log",
+        f"--stderr={OUT.resolve()}/{scenario}_stderr.log",
+        udid, BUNDLE_ID, env=env,
     )
     pid = int(launch.strip().split(":")[-1])
-    print(f"Launched pid {pid}")
+    print(f"[{scenario}] pid {pid}", flush=True)
 
-    data_dir = Path(run("xcrun", "simctl", "get_app_container", udid, BUNDLE_ID, "data").strip())
-    log_path = data_dir / "tmp" / "repro_phases.log"
-
-    cpu = {}
-    sampled = set()
-    samplers = []
-    deadline = time.time() + PHASE_SECONDS * (len(EXPECTED) + 2)
+    cpu, sampled, samplers = {}, set(), []
+    deadline = time.time() + PHASE_SECONDS * (len(PHASES) + 2)
     while time.time() < deadline:
-        phase, started, _ = current_phase(log_path)
+        phase, started, _ = read_log(log_path)
         if phase == "DONE":
             break
         if phase is None:
@@ -125,57 +109,84 @@ def main():
         if SETTLE_SECONDS <= elapsed < PHASE_SECONDS - 1:
             value = run("ps", "-p", str(pid), "-o", "%cpu=", check=False).strip()
             if not value:
-                sys.exit("App process exited early; see app_stderr.log")
+                sys.exit(f"[{scenario}] app exited early; see {scenario}_stderr.log")
             cpu.setdefault(phase, []).append(float(value))
             if phase not in sampled:
                 sampled.add(phase)
                 samplers.append(subprocess.Popen(
-                    ["sample", str(pid), str(SAMPLE_SECONDS), "-file", str(OUT / f"sample_{phase}.txt")],
+                    ["sample", str(pid), str(SAMPLE_SECONDS), "-file",
+                     str(OUT / f"sample_{scenario}_{phase}.txt")],
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 ))
         time.sleep(1)
-
     for sampler in samplers:
         sampler.wait()
-    _, _, lines = current_phase(log_path)
-    (OUT / "phases.log").write_text("\n".join(lines) + "\n")
+
+    _, _, lines = read_log(log_path)
+    (OUT / f"{scenario}_phases.log").write_text("\n".join(lines) + "\n")
+    events = {
+        "INITIALIZED": sum(" INITIALIZED" in l for l in lines),
+        "INIT_FAILED": sum(" INIT_FAILED" in l for l in lines),
+        "DISPOSED": sum(" DISPOSED" in l for l in lines),
+    }
 
     rows = []
-    for phase, expected in EXPECTED.items():
+    for phase in PHASES:
         values = cpu.get(phase, [])
         avg = sum(values) / len(values) if values else float("nan")
-        sample_path = OUT / f"sample_{phase}.txt"
-        text = sample_path.read_text(errors="replace") if sample_path.exists() else ""
+        path = OUT / f"sample_{scenario}_{phase}.txt"
+        text = path.read_text(errors="replace") if path.exists() else ""
         counts = {k: max_samples(text, needle) for k, needle in SYMBOLS.items()}
-        rows.append((phase, expected, avg, len(values), counts))
+        rows.append((scenario, phase, avg, len(values), counts))
+    return rows, events
 
-    header = (
-        "| Phase | Expected | Avg CPU % (idle window) | ps samples "
-        "| displayLinkFired | textureFrameAvailable | DrawLastLayerTrees |"
+
+def main():
+    if not APP_PATH.exists():
+        sys.exit(f"{APP_PATH} missing; run: flutter build ios --simulator --debug")
+    OUT.mkdir(parents=True, exist_ok=True)
+
+    device = pick_device()
+    udid = device["udid"]
+    print(f"Simulator: {device['name']} ({udid})", flush=True)
+    if device["state"] != "Booted":
+        run("xcrun", "simctl", "boot", udid, check=False)
+    run("xcrun", "simctl", "bootstatus", udid, "-b")
+    run("xcrun", "simctl", "install", udid, str(APP_PATH))
+    data_dir = Path(run("xcrun", "simctl", "get_app_container", udid, BUNDLE_ID, "data").strip())
+    log_path = data_dir / "tmp" / "repro_phases.log"
+
+    table = [
+        "| Scenario | Phase | Avg CPU % | ps samples | Verdict "
+        "| displayLinkFired | textureFrameAvailable | DrawLastLayerTrees |",
+        "|" + "---|" * 8,
+    ]
+    event_lines = []
+    for scenario in SCENARIOS:
+        rows, events = run_scenario(udid, scenario, log_path)
+        event_lines.append(f"- {scenario}: {events}")
+        for _, phase, avg, n, c in rows:
+            verdict = "BUSY" if avg >= BUSY_CPU else "idle"
+            table.append(
+                f"| {scenario} | {phase} | {avg:.1f} | {n} | {verdict} "
+                f"| {c['displayLinkFired']} | {c['textureFrameAvailable']} "
+                f"| {c['DrawLastLayerTrees']} |"
+            )
+
+    title = f"## iOS Simulator idle cost {LABEL}".rstrip()
+    summary = (
+        f"{title}\n\nSimulator: {device['name']}\n\n"
+        + "\n".join(table)
+        + f"\n\nPhases are {PHASE_SECONDS}s; CPU is averaged from second {SETTLE_SECONDS} "
+        "of each phase. Stack columns: peak sample count containing the symbol "
+        f"during a {SAMPLE_SECONDS}s `sample` of the app (0 = not seen).\n\n"
+        "Video events per scenario:\n" + "\n".join(event_lines) + "\n"
     )
-    table = [header, "|" + "---|" * 7]
-    for phase, expected, avg, n, c in rows:
-        table.append(
-            f"| {phase} | {expected} | {avg:.1f} | {n} | {c['displayLinkFired']} "
-            f"| {c['textureFrameAvailable']} | {c['DrawLastLayerTrees']} |"
-        )
-    note = (
-        f"\nStack columns: peak sample count containing the symbol during a "
-        f"{SAMPLE_SECONDS}s `sample` of the app (0 = never seen). "
-        "Symbols may be missing if the engine binary is stripped; CPU % is the primary signal.\n"
-    )
-    summary = "\n".join(table) + "\n" + note
     (OUT / "summary.md").write_text(summary)
     print(summary)
-
-    init_lines = [l for l in lines if "INIT" in l]
-    print(f"Video init events: {len(init_lines)}")
-    for line in init_lines:
-        print("  " + line)
-
     if summary_file := os.environ.get("GITHUB_STEP_SUMMARY"):
         with open(summary_file, "a") as f:
-            f.write("## iOS Simulator idle-cost measurement\n\n" + summary)
+            f.write(summary)
 
 
 if __name__ == "__main__":

@@ -7,11 +7,14 @@
 // CADisplayLink when the texture is registered and stops it only after the
 // engine has pulled one frame from the texture. A texture that is never
 // composited is never pulled, so the display link fires every vsync and calls
-// textureFrameAvailable, which makes the engine redraw the last frame forever.
+// textureFrameAvailable, which makes the engine redraw the last frame. Before
+// video_player_avfoundation 2.9.4 the display link also kept running after the
+// controller was disposed.
 //
-// The app runs a fixed sequence of phases with no user input. The host script
-// (tool/measure_ios_sim.sh) samples CPU and native stacks of the simulator
-// process during each phase.
+// Each launch runs one scenario, chosen by the REPRO_SCENARIO environment
+// variable (set with SIMCTL_CHILD_REPRO_SCENARIO), through three phases with no
+// user input. The host script (tool/measure_ios_sim.py) samples CPU and native
+// stacks of the simulator process during each phase.
 
 import 'dart:async';
 import 'dart:io';
@@ -22,19 +25,21 @@ import 'package:video_player/video_player.dart';
 const videoUrl =
     'https://flutter.github.io/assets-for-api-docs/assets/videos/bee.mp4';
 const phaseDuration = Duration(seconds: 20);
+const pushOtherScreenAfter = Duration(seconds: 5);
 const cardCount = 3;
 
-enum Phase {
-  controlIdle('No video controllers. Baseline idle.'),
-  bugFeed('Feed pattern: controllers initialized, only thumbnails shown.'),
-  bugUnderOtherScreen('Feed pattern covered by another pushed screen.'),
-  fixLazyInit('Fix: controller created only on play tap (never tapped).'),
-  shownThenPaused('Controllers initialized and texture shown, paused.'),
-  controlIdleEnd('All cards disposed again. Baseline idle.');
-
-  const Phase(this.description);
-  final String description;
+enum Scenario {
+  // Realize pattern: controllers initialized, only thumbnails shown.
+  eagerThumbnail,
+  // Realize pattern with another screen pushed on top of the feed.
+  eagerThumbnailUnderRoute,
+  // Controllers initialized and the video texture shown, paused.
+  eagerShown,
+  // Fix: controller created only when play is tapped (never tapped here).
+  lazy,
 }
+
+enum Phase { baseline, active, afterDispose }
 
 final _logFile = File('${Directory.systemTemp.path}/repro_phases.log');
 
@@ -46,12 +51,18 @@ void _log(String line) {
 }
 
 void main() {
-  if (_logFile.existsSync()) _logFile.deleteSync();
-  runApp(const ReproApp());
+  final name = Platform.environment['REPRO_SCENARIO'];
+  final scenario = Scenario.values.firstWhere(
+    (s) => s.name == name,
+    orElse: () => Scenario.eagerThumbnail,
+  );
+  runApp(ReproApp(scenario: scenario));
 }
 
 class ReproApp extends StatefulWidget {
-  const ReproApp({super.key});
+  const ReproApp({super.key, required this.scenario});
+
+  final Scenario scenario;
 
   @override
   State<ReproApp> createState() => _ReproAppState();
@@ -59,40 +70,44 @@ class ReproApp extends StatefulWidget {
 
 class _ReproAppState extends State<ReproApp> {
   final _navigatorKey = GlobalKey<NavigatorState>();
-  var _phaseIndex = 0;
-  Timer? _timer;
-
-  Phase get _phase => Phase.values[_phaseIndex];
+  var _phase = Phase.baseline;
+  var _routePushed = false;
+  final _timers = <Timer>[];
 
   @override
   void initState() {
     super.initState();
-    _enterPhase();
-    _timer = Timer.periodic(phaseDuration, (_) => _nextPhase());
+    _log('SCENARIO ${widget.scenario.name}');
+    _log('PHASE ${_phase.name}');
+    _timers.add(Timer(phaseDuration, () => _enter(Phase.active)));
+    _timers.add(Timer(phaseDuration * 2, () => _enter(Phase.afterDispose)));
+    _timers.add(Timer(phaseDuration * 3, () => _log('DONE')));
   }
 
-  void _nextPhase() {
-    final navigator = _navigatorKey.currentState!;
-    if (_phase == Phase.bugUnderOtherScreen) navigator.pop();
-
-    if (_phaseIndex == Phase.values.length - 1) {
-      _timer?.cancel();
-      _log('DONE');
-      return;
+  void _enter(Phase phase) {
+    if (_routePushed) {
+      _navigatorKey.currentState!.pop();
+      _routePushed = false;
     }
-    setState(() => _phaseIndex++);
-    _enterPhase();
+    setState(() => _phase = phase);
+    _log('PHASE ${phase.name}');
 
-    if (_phase == Phase.bugUnderOtherScreen) {
-      navigator.push(MaterialPageRoute(builder: (_) => const OtherScreen()));
+    if (phase == Phase.active &&
+        widget.scenario == Scenario.eagerThumbnailUnderRoute) {
+      _timers.add(Timer(pushOtherScreenAfter, () {
+        _routePushed = true;
+        _navigatorKey.currentState!.push(
+          MaterialPageRoute(builder: (_) => const OtherScreen()),
+        );
+      }));
     }
   }
-
-  void _enterPhase() => _log('PHASE ${_phase.name}');
 
   @override
   void dispose() {
-    _timer?.cancel();
+    for (final timer in _timers) {
+      timer.cancel();
+    }
     super.dispose();
   }
 
@@ -101,39 +116,31 @@ class _ReproAppState extends State<ReproApp> {
     return MaterialApp(
       navigatorKey: _navigatorKey,
       debugShowCheckedModeBanner: false,
-      home: FeedScreen(phase: _phase),
+      home: FeedScreen(scenario: widget.scenario, phase: _phase),
     );
   }
 }
 
 class FeedScreen extends StatelessWidget {
-  const FeedScreen({super.key, required this.phase});
+  const FeedScreen({super.key, required this.scenario, required this.phase});
 
+  final Scenario scenario;
   final Phase phase;
 
   @override
   Widget build(BuildContext context) {
-    final cardMode = switch (phase) {
-      Phase.controlIdle || Phase.controlIdleEnd => null,
-      Phase.bugFeed || Phase.bugUnderOtherScreen => CardMode.eagerThumbnail,
-      Phase.fixLazyInit => CardMode.lazy,
-      Phase.shownThenPaused => CardMode.eagerShown,
-    };
-
+    final showVideos = phase == Phase.active;
     return Scaffold(
-      appBar: AppBar(title: Text(phase.name)),
+      appBar: AppBar(title: Text('${scenario.name} / ${phase.name}')),
       body: ListView(
         padding: const EdgeInsets.all(8),
         children: [
-          Text(phase.description),
-          const SizedBox(height: 8),
           for (var i = 0; i < cardCount; i++)
             Padding(
               padding: const EdgeInsets.only(bottom: 8),
-              child: cardMode == null
-                  ? const Thumbnail()
-                  // Keyed by mode so each phase disposes and recreates cards.
-                  : VideoCard(key: ValueKey('$cardMode-$i'), mode: cardMode),
+              child: showVideos
+                  ? VideoCard(key: ValueKey(i), scenario: scenario)
+                  : const Thumbnail(),
             ),
         ],
       ),
@@ -153,12 +160,10 @@ class OtherScreen extends StatelessWidget {
   }
 }
 
-enum CardMode { eagerThumbnail, eagerShown, lazy }
-
 class VideoCard extends StatefulWidget {
-  const VideoCard({super.key, required this.mode});
+  const VideoCard({super.key, required this.scenario});
 
-  final CardMode mode;
+  final Scenario scenario;
 
   @override
   State<VideoCard> createState() => _VideoCardState();
@@ -171,7 +176,7 @@ class _VideoCardState extends State<VideoCard> {
   void initState() {
     super.initState();
     // Same as PostVideo._initializeVideo in realize-app-flutter.
-    if (widget.mode != CardMode.lazy) _initializeVideo();
+    if (widget.scenario != Scenario.lazy) _initializeVideo();
   }
 
   Future<void> _initializeVideo() async {
@@ -179,9 +184,9 @@ class _VideoCardState extends State<VideoCard> {
     _controller = controller;
     try {
       await controller.initialize();
-      _log('INITIALIZED ${widget.mode.name}');
+      _log('INITIALIZED');
     } catch (e) {
-      _log('INIT_FAILED ${widget.mode.name} $e');
+      _log('INIT_FAILED $e');
     }
     if (mounted) setState(() {});
   }
@@ -189,7 +194,7 @@ class _VideoCardState extends State<VideoCard> {
   @override
   Widget build(BuildContext context) {
     final controller = _controller;
-    if (widget.mode == CardMode.eagerShown &&
+    if (widget.scenario == Scenario.eagerShown &&
         controller != null &&
         controller.value.isInitialized) {
       return AspectRatio(
@@ -203,6 +208,7 @@ class _VideoCardState extends State<VideoCard> {
   @override
   void dispose() {
     _controller?.dispose();
+    _log('DISPOSED');
     super.dispose();
   }
 }

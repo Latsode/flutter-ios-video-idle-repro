@@ -9,26 +9,56 @@ jobs:
   measure:
     runs-on: macos-15
     timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Same Flutter and plugin versions as realize-app-flutter.
+          - label: realize-current (Flutter 3.27.4, avfoundation 2.8.4)
+            artifact: realize-current
+            flutter: 3.27.4
+            upgrade_plugin: false
+          # Latest plugin, which stops the display link on dispose (2.9.4+).
+          - label: upgraded (Flutter 3.44.2, latest video_player)
+            artifact: upgraded
+            flutter: 3.44.2
+            upgrade_plugin: true
     steps:
       - uses: actions/checkout@v4
 
       - uses: subosito/flutter-action@v2
         with:
-          # Same Flutter version as realize-app-flutter .fvmrc.
-          flutter-version: 3.27.4
+          flutter-version: ${{ matrix.flutter }}
           channel: stable
           cache: true
 
+      - name: Use latest video_player
+        if: matrix.upgrade_plugin
+        run: |
+          python3 - <<'PY'
+          import re
+          p = open('pubspec.yaml').read()
+          p = p.replace('video_player: 2.10.0', 'video_player: any')
+          p = re.sub(r'dependency_overrides:\n  video_player_avfoundation: 2\.8\.4\n', '', p)
+          open('pubspec.yaml', 'w').write(p)
+          PY
+          flutter pub upgrade
+
       - run: flutter pub get
+
+      - name: Show resolved plugin versions
+        run: grep -A4 -E '^  video_player(_avfoundation)?:' pubspec.lock
 
       - name: Build for simulator
         run: flutter build ios --simulator --debug
 
       - name: Run and measure
+        env:
+          REPRO_LABEL: ${{ matrix.label }}
         run: python3 tool/measure_ios_sim.py
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: repro-results
+          name: repro-results-${{ matrix.artifact }}
           path: build/repro-results
