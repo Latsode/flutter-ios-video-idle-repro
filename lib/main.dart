@@ -20,6 +20,7 @@
 import 'dart:async';
 import 'dart:io';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:video_player/video_player.dart';
 import 'package:visibility_detector/visibility_detector.dart';
@@ -36,8 +37,8 @@ enum Scenario {
   // Isolation check: initialize in initState, video painted under an opaque
   // thumbnail. The feed has no cache extent so every built card is painted.
   coveredWarm,
-  // Proposed PostVideo: warm up only when visible, video painted under the
-  // thumbnail, released when scrolled away.
+  // Proposed PostVideo: warm up as soon as any part is visible, video painted
+  // under an opaque backdrop and the thumbnail, released when fully off screen.
   proposed,
   // Initialize only when play is tapped (cold start reference).
   lazy,
@@ -72,6 +73,11 @@ void _disposeController(VideoPlayerController controller) {
 final _cards = <int, VideoCardState>{};
 
 void main() {
+  FlutterError.onError = (details) => _log('FLUTTER_ERROR ${details.exception}');
+  PlatformDispatcher.instance.onError = (error, stack) {
+    _log('UNCAUGHT_ERROR $error');
+    return true;
+  };
   final name = _scenarioFile.existsSync()
       ? _scenarioFile.readAsStringSync().trim()
       : null;
@@ -249,7 +255,7 @@ class VideoCardState extends State<VideoCard> {
   /// Completes when this card has nothing more to preload.
   Future<void> get preloaded => switch (_scenario) {
         Scenario.lazy => Future.value(),
-        Scenario.proposed when visibleFraction < 0.6 => Future.value(),
+        Scenario.proposed when visibleFraction == 0 => Future.value(),
         _ => _initializing ?? Future.value(),
       };
 
@@ -269,12 +275,17 @@ class VideoCardState extends State<VideoCard> {
     if (existing != null) return existing;
     final controller = _createController();
     _controller = controller;
-    return _initializing = controller.initialize().then((_) {
+    return _initializing = _initialize(controller);
+  }
+
+  Future<void> _initialize(VideoPlayerController controller) async {
+    try {
+      await controller.initialize();
       _log('INITIALIZED card=${widget.index}');
       if (mounted && _controller == controller) setState(() {});
-    }).catchError((Object e) {
+    } catch (e) {
       _log('INIT_FAILED card=${widget.index} $e');
-    });
+    }
   }
 
   void _release() {
@@ -290,7 +301,7 @@ class VideoCardState extends State<VideoCard> {
   void _onVisibilityChanged(VisibilityInfo info) {
     visibleFraction = info.visibleFraction;
     if (!mounted || _scenario != Scenario.proposed) return;
-    if (info.visibleFraction >= 0.6) {
+    if (info.visibleFraction > 0) {
       _warmUp();
     } else if (info.visibleFraction == 0 && !_hasStarted) {
       _release();
@@ -338,10 +349,15 @@ class VideoCardState extends State<VideoCard> {
     if (_hasStarted && _ready) return VideoPlayer(controller!);
     if (paintUnderThumbnail && _ready) {
       // The video must be painted (not Offstage/Opacity 0) so the plugin
-      // receives its first frame and stops its display link.
+      // receives its first frame and stops its display link. The opaque
+      // backdrop keeps the frame hidden while the thumbnail loads or fades in.
       return Stack(
         fit: StackFit.expand,
-        children: [VideoPlayer(controller!), Thumbnail(index: widget.index)],
+        children: [
+          VideoPlayer(controller!),
+          const ColoredBox(color: Colors.black),
+          Thumbnail(index: widget.index),
+        ],
       );
     }
     return Thumbnail(index: widget.index);

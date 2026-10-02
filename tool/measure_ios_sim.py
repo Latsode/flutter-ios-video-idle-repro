@@ -127,6 +127,9 @@ def run_scenario(udid, scenario):
         window, started, done, _ = read_log(log_path)
         if done:
             break
+        if not run("ps", "-p", str(pid), "-o", "pid=", check=False).strip():
+            print(f"[{scenario}] app process exited", flush=True)
+            break
         if window and MEASURE_FROM <= time.time() - started < MEASURE_TO:
             value = run("ps", "-p", str(pid), "-o", "%cpu=", check=False).strip()
             if not value:
@@ -162,6 +165,7 @@ def run_scenario(udid, scenario):
         "init_failed": count("INIT_FAILED"),
         "released": count("RELEASED"),
         "ready_timeouts": count("READY_TIMEOUT"),
+        "errors": count("FLUTTER_ERROR") + count("UNCAUGHT_ERROR"),
         "start_latency_ms": latency,
     }
 

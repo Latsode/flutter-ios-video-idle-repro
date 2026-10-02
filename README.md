@@ -23,7 +23,7 @@ removed). Idle cost is measured in each phase except `play`.
 |---|---|
 | eagerThumbnail | Current Realize `PostVideo`: initialize in `initState`, thumbnail only |
 | coveredWarm | Initialize in `initState`, video painted under an opaque thumbnail (feed without cache extent) |
-| proposed | Initialize when at least 60% visible, video painted under the thumbnail, released when fully off screen |
+| proposed | Initialize as soon as any part is visible, video painted under an opaque backdrop and the thumbnail, released when fully off screen |
 | lazy | Initialize only when play is tapped |
 
 CI runs it with Realize `dev` versions (Flutter 3.47.5, avfoundation 2.8.4) and
