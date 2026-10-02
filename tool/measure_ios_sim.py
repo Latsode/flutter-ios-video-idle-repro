@@ -101,9 +101,18 @@ def launch(udid, scenario):
     sys.exit(f"[{scenario}] could not launch app")
 
 
-def run_scenario(udid, scenario, data_dir):
+def ensure_booted(udid):
+    # The simulator has been seen shutting down after a scenario that leaks
+    # display links, so boot it again if needed before every launch.
+    run("xcrun", "simctl", "boot", udid, check=False)
+    run("xcrun", "simctl", "bootstatus", udid, "-b")
+
+
+def run_scenario(udid, scenario):
     run("xcrun", "simctl", "terminate", udid, BUNDLE_ID, check=False)
     time.sleep(3)
+    ensure_booted(udid)
+    data_dir = Path(run("xcrun", "simctl", "get_app_container", udid, BUNDLE_ID, "data").strip())
     tmp = data_dir / "tmp"
     tmp.mkdir(parents=True, exist_ok=True)
     log_path = tmp / "repro_phases.log"
@@ -163,11 +172,8 @@ def main():
     device = pick_device()
     udid = device["udid"]
     print(f"Simulator: {device['name']} ({udid})", flush=True)
-    if device["state"] != "Booted":
-        run("xcrun", "simctl", "boot", udid, check=False)
-    run("xcrun", "simctl", "bootstatus", udid, "-b")
+    ensure_booted(udid)
     run("xcrun", "simctl", "install", udid, str(APP_PATH))
-    data_dir = Path(run("xcrun", "simctl", "get_app_container", udid, BUNDLE_ID, "data").strip())
 
     table = [
         "| Scenario | Phase | Avg CPU % | ps samples | Verdict "
@@ -176,7 +182,7 @@ def main():
     ]
     event_lines = []
     for scenario in SCENARIOS:
-        rows, events = run_scenario(udid, scenario, data_dir)
+        rows, events = run_scenario(udid, scenario)
         event_lines.append(f"- {scenario}: {events}")
         for _, phase, avg, n, c in rows:
             verdict = "BUSY" if avg >= BUSY_CPU else "idle"
